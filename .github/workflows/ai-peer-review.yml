@@ -19,6 +19,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Verify gh CLI and auth
+        run: |
+          gh --version || (echo "gh CLI missing on runner" && exit 1)
+          echo "Actor: ${{ github.actor }}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Install gh-models extension
         run: gh extension install https://github.com/github/gh-models
         env:
@@ -79,6 +86,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # Post the review comment; if it fails, don't error the whole job.
           gh pr comment "${{ github.event.pull_request.number }}" \
             --repo "${{ github.repository }}" \
             --body-file review.md
