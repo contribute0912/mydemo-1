@@ -1,14 +1,14 @@
 
-name: PR Summary & Review
+name: PR Summarize & Review
 
 on:
   pull_request:
-    types: [opened, reopened, ready_for_review]
+    types: [opened, reopened, synchronize, ready_for_review]
 
 permissions:
   contents: read
   pull-requests: write
-  models: read
+  models: read   # Required for GitHub Models
 
 jobs:
   ai_summary_review:
