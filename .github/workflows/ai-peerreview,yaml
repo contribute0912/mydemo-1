@@ -4,7 +4,7 @@ name: AI PR Review
 on:
   pull_request:
     types: [opened, synchronize, reopened]
-  workflow_dispatch:   # optional: lets you run it manually from Actions tab
+  workflow_dispatch:   # optional: run manually from Actions tab
 
 permissions:
   contents: read
@@ -63,3 +63,4 @@ jobs:
             --repo "${{ github.repository }}" \
             --body-file review.md
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
