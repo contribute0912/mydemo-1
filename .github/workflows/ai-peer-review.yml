@@ -56,3 +56,29 @@ jobs:
             - If nothing critical, end with: "No blockers; consider nits".
             Diff:
             {{input}}
+          temperature: 0.2
+          top_p: 0.9
+          EOF
+
+      - name: Run model on diff
+        id: review
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -z "${{ steps.diff.outputs.changeset }}" ]; then
+            echo "No changes detected in diff; skipping model run." >&2
+            printf "No changes found in the PR diff.\n" > review.md
+          else
+            gh models run --file prompt.yml \
+              --var input="${{ steps.diff.outputs.changeset }}" \
+              --max-tokens 2000 \
+              > review.md || echo ":warning: AI review could not be generated." > review.md
+          fi
+
+      - name: Comment on PR with AI review
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr comment "${{ github.event.pull_request.number }}" \
+            --repo "${{ github.repository }}" \
+            --body-file review.md || echo "[Info] Comment step failed."
