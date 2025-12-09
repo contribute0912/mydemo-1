@@ -1,0 +1,66 @@
+
+name: AI PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:   # optional: run manually from Actions tab
+
+permissions:
+  contents: read
+  pull-requests: write
+  models: read
+
+jobs:
+  llm_review:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install gh-models extension
+        run: gh extension install https://github.com/github/gh-models
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get PR diff
+        id: diff
+        run: |
+          echo "changeset<<EOF" >> $GITHUB_OUTPUT
+          gh pr diff "${{ github.event.pull_request.number }}" \
+            --repo "${{ github.repository }}" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run model on diff
+        id: review
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cat << 'PROMPT' > prompt.txt
+          Act as a senior code reviewer. Given the unified diff below:
+          - Summarize the intent of the change.
+          - Flag security risks, performance issues, and code smells.
+          - Suggest specific, minimal edits (patch-style if possible).
+          - If nothing critical, end with: "No blockers; consider nits".
+          Diff:
+          {{input}}
+          PROMPT
+
+          printf "%s" "${{ steps.diff.outputs.changeset }}" \
+            | gh models run openai/gpt-4.1-mini \
+                --system "You are a rigorous, concise code reviewer." \
+                --input - \
+                --prompt-file prompt.txt \
+                --temperature 0.2 \
+                --seed 42 > review.md
+
+      - name: Comment on PR with AI review
+        run: |
+          gh pr comment "${{ github.event.pull_request.number }}" \
+            --repo "${{ github.repository }}" \
+            --body-file review.md
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
