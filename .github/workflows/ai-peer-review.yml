@@ -4,7 +4,7 @@ name: AI PR Review
 on:
   pull_request:
     types: [opened, synchronize, reopened]
-  workflow_dispatch:   # optional: run manually from Actions tab
+  workflow_dispatch:   # allows manual run from the Actions tab
 
 permissions:
   contents: read
@@ -19,6 +19,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Verify gh CLI and auth
+        run: |
+          gh --version || (echo "gh CLI missing on runner" && exit 1)
+          echo "Actor: ${{ github.actor }}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Install gh-models extension
         run: gh extension install https://github.com/github/gh-models
         env:
@@ -28,16 +35,14 @@ jobs:
         id: diff
         run: |
           echo "changeset<<EOF" >> $GITHUB_OUTPUT
-          gh pr diff "${{ github.event.pull_request.number }}" \
-            --repo "${{ github.repository }}" >> $GITHUB_OUTPUT
+          if ! gh pr diff "${{ github.event.pull_request.number }}" --repo "${{ github.repository }}" >> $GITHUB_OUTPUT; then
+            echo "[Info] Could not fetch diff for PR #${{ github.event.pull_request.number }}." >> $GITHUB_OUTPUT
+          fi
           echo "EOF" >> $GITHUB_OUTPUT
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Run model on diff
-        id: review
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Prepare review prompt
         run: |
           cat << 'PROMPT' > prompt.txt
           Act as a senior code reviewer. Given the unified diff below:
@@ -49,18 +54,28 @@ jobs:
           {{input}}
           PROMPT
 
-          printf "%s" "${{ steps.diff.outputs.changeset }}" \
+      - name: Run model on diff
+        id: review
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Try to generate the review. If model call fails, create a fallback message.
+          if ! printf "%s" "${{ steps.diff.outputs.changeset }}" \
             | gh models run openai/gpt-4.1-mini \
                 --system "You are a rigorous, concise code reviewer." \
                 --input - \
                 --prompt-file prompt.txt \
                 --temperature 0.2 \
-                --seed 42 > review.md
+                --seed 42 > review.md; then
+            echo ":warning: AI review could not be generated. Check workflow permissions (models: read) and Actions settings." > review.md
+          fi
 
       - name: Comment on PR with AI review
         run: |
+          # Post the review comment; if it fails, don't error the whole job.
           gh pr comment "${{ github.event.pull_request.number }}" \
             --repo "${{ github.repository }}" \
-            --body-file review.md
+            --body-file review.md \
+          || echo "[Info] Comment step failed (permissions or PR state)."
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
