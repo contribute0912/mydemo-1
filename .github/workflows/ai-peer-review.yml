@@ -4,7 +4,7 @@ name: AI PR Review
 on:
   pull_request:
     types: [opened, synchronize, reopened]
-  workflow_dispatch:   # optional: run manually from Actions tab
+  workflow_dispatch: # optional: run manually from the Actions tab
 
 permissions:
   contents: read
@@ -26,41 +26,59 @@ jobs:
 
       - name: Get PR diff
         id: diff
-        run: |
-          echo "changeset<<EOF" >> $GITHUB_OUTPUT
-          gh pr diff "${{ github.event.pull_request.number }}" \
-            --repo "${{ github.repository }}" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          # Capture the PR diff and expose it as an output named 'changeset'
+          {
+            echo 'changeset<<EOF'
+            gh pr diff "${{ github.event.pull_request.number }}" \
+              --repo "${{ github.repository }}"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build prompt template
+        run: |
+          cat << 'EOF' > prompt.yml
+          name: code-review
+          model: openai/gpt-4o-mini
+          system: You are a rigorous, concise code reviewer.
+          prompt: |
+            Act as a senior code reviewer. Given the unified diff below:
+            - Summarize the intent of the change.
+            - Flag security risks, performance issues, and code smells.
+            - Suggest specific, minimal edits (patch-style if possible).
+            - If nothing critical, end with: "No blockers; consider nits".
+            Diff:
+            {{input}}
+          temperature: 0.2
+          top_p: 0.9
+          EOF
 
       - name: Run model on diff
         id: review
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
         run: |
-          cat << 'PROMPT' > prompt.txt
-          Act as a senior code reviewer. Given the unified diff below:
-          - Summarize the intent of the change.
-          - Flag security risks, performance issues, and code smells.
-          - Suggest specific, minimal edits (patch-style if possible).
-          - If nothing critical, end with: "No blockers; consider nits".
-          Diff:
-          {{input}}
-          PROMPT
+          # If the diff is empty, short-circuit to avoid a noisy comment
+          if [ -z "${{ steps.diff.outputs.changeset }}" ]; then
+            echo "No changes detected in diff; skipping model run." >&2
+            printf "No changes found in the PR diff.\n" > review.md
+            exit 0
+          fi
 
-          printf "%s" "${{ steps.diff.outputs.changeset }}" \
-            | gh models run openai/gpt-4.1-mini \
-                --system "You are a rigorous, concise code reviewer." \
-                --input - \
-                --prompt-file prompt.txt \
-                --temperature 0.2 \
-                --seed 42 > review.md
+          # Run the model with the diff as input, writing to review.md
+          gh models run --file prompt.yml \
+            --var input="${{ steps.diff.outputs.changeset }}" \
+            > review.md
 
       - name: Comment on PR with AI review
+        if: success() # still posts the simple message if diff was empty
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh pr comment "${{ github.event.pull_request.number }}" \
             --repo "${{ github.repository }}" \
             --body-file review.md
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
