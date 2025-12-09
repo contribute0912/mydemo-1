@@ -1,121 +1,84 @@
 
-name: PR Summary & Review
+name: PR Summarize & Review
 
 on:
   pull_request:
     types: [opened, reopened, synchronize, ready_for_review]
 
 permissions:
-  pull-requests: write
   contents: read
+  pull-requests: write
 
 jobs:
-  summarize_and_review:
+  ai_summary_review:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - name: Gather PR info
         id: prinfo
-        shell: bash
         run: |
+          echo "Collecting PR details..."
           echo "pr_number=${{ github.event.pull_request.number }}" >> $GITHUB_OUTPUT
-          echo "pr_title<<EOF" >> $GITHUB_OUTPUT
-          echo "${{ github.event.pull_request.title }}" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
-          echo "pr_author=${{ github.event.pull_request.user.login }}" >> $GITHUB_OUTPUT
+          echo "${{ github.event.pull_request.title }}" > pr_title.txt
+          echo "${{ github.event.pull_request.body || '(no description provided)' }}" > pr_body.txt
 
-          # Save title/body to files
-          printf "%s" '${{ github.event.pull_request.title }}' > pr_title.txt
-          printf "%s" '${{ github.event.pull_request.body }}' > pr_body.txt
-
-          # Base/head SHAs for diff
           BASE_SHA="${{ github.event.pull_request.base.sha }}"
           HEAD_SHA="${{ github.event.pull_request.head.sha }}"
-
-          # Unified diff without context (compact); you can change to --unified=3 for more context
+          echo "Generating diff..."
           git diff --unified=0 "$BASE_SHA" "$HEAD_SHA" > pr.diff || true
 
-          # Trim overly large diffs to keep model payload sane (512 KB)
-          MAX_KB=512
-          ACTUAL_KB=$(du -k pr.diff | cut -f1)
-          if [ "$ACTUAL_KB" -gt "$MAX_KB" ]; then
-            echo "Diff is $ACTUAL_KB KB; truncating to $MAX_KB KB."
-            head -c $((MAX_KB * 1024)) pr.diff > pr_trimmed.diff
+          # Limit diff size to 512 KB
+          if [ $(wc -c < pr.diff) -gt $((512*1024)) ]; then
+            echo "Diff too large, truncating..."
+            head -c $((512*1024)) pr.diff > pr_trimmed.diff
             mv pr_trimmed.diff pr.diff
           fi
 
-      - name: Build prompts (summary + review)
-        id: prompts
-        shell: bash
+      - name: Build prompt
         run: |
-          # System prompts
-          cat > system_summary.txt << 'SYS'
-You are an expert technical summarizer. Produce a crisp summary for reviewers.
-Style: 3–5 bullets. Avoid boilerplate. Mention scope, key files, and notable impacts.
+          echo "Creating prompt for AI..."
+          cat > system.txt << 'SYS'
+You are a senior engineer providing a PR summary and review.
+Sections:
+- What Looks Good
+- Summary (3–5 bullets)
+- Suggestions (specific, actionable)
+- Risks & Edge Cases
+- Tests & Docs Checklist
 SYS
 
-          cat > system_review.txt << 'SYS'
-You are a senior code reviewer. Provide concise, actionable feedback:
-- Identify bugs, security issues, performance risks, and maintainability concerns.
-- Call out missing tests/docs and edge cases.
-- Suggest concrete improvements with example diffs/snippets where helpful.
-- Keep sections: Summary, Risks, Suggestions, Tests, Checklist.
-- Be specific; avoid generic advice.
-SYS
-
-          # User prompts
           {
-            echo "Summarize this pull request in 3–5 bullet points:"
-            echo "- What it changes"
-            echo "- Why it matters"
-            echo "- Notable impacts (perf, security, breaking changes)"
-            echo
-            echo "### PR Title"
+            echo "Analyze this PR:"
+            echo "### Title"
             cat pr_title.txt
-            echo
-            echo "### PR Description"
-            sed -e 's/\r//g' pr_body.txt
-            echo
-            echo "### Diff (trimmed)"
-            sed -e 's/\r//g' pr.diff
-          } > prompt_summary.txt
+            echo "### Description"
+            cat pr_body.txt
+            echo "### Diff"
+            cat pr.diff
+          } > prompt.txt
 
-          {
-            echo "Review the following pull request. Focus on correctness, security, performance, and test coverage."
-            echo
-            echo "### PR Title"
-            cat pr_title.txt
-            echo
-            echo "### PR Description"
-            sed -e 's/\r//g' pr_body.txt
-            echo
-            echo "### Diff (trimmed)"
-            sed -e 's/\r//g' pr.diff
-          } > prompt_review.txt
-
-      - name: Call GitHub Models for Summary
-        id: gh_summary
+      - name: Call GitHub Models
         env:
-          GH_MODELS_API_KEY: ${{ secrets.GH_MODELS_API_KEY }}
-        shell: bash
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          echo "Calling GitHub Models API..."
           ENDPOINT="https://models.inference.ai.azure.com/chat/completions"
-          MODEL="gpt-4o-mini"  # or o3-mini for deeper reasoning
+          MODEL="gpt-4o-mini"
 
-          python - << 'PY' > payload_summary.json
+          python - << 'PY' > payload.json
 import json
 payload = {
   "model": "gpt-4o-mini",
   "temperature": 0.2,
-  "max_tokens": 600,
+  "max_tokens": 2200,
   "messages": [
-    {"role":"system","content": open('system_summary.txt').read()},
-    {"role":"user","content": open('prompt_summary.txt').read()}
+    {"role":"system","content": open('system.txt').read()},
+    {"role":"user","content": open('prompt.txt').read()}
   ]
 }
 print(json.dumps(payload))
@@ -123,132 +86,34 @@ PY
 
           curl -sS "$ENDPOINT" \
             -H "Content-Type: application/json" \
-            -H "api-key: $GH_MODELS_API_KEY" \
-            -d @payload_summary.json > gh_summary.json
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -d @payload.json > response.json
 
           python - << 'PY'
 import json
-data=json.load(open('gh_summary.json'))
-msg=data.get("choices",[{}])[0].get("message",{}).get("content","(No summary generated)")
-open('summary.txt','w').write(msg)
+data=json.load(open('response.json'))
+msg=data.get("choices",[{}])[0].get("message",{}).get("content","(No output)")
+open('ai_output.txt','w').write(msg)
 PY
 
-      - name: Call GitHub Models for Review
-        id: gh_review
-        env:
-          GH_MODELS_API_KEY: ${{ secrets.GH_MODELS_API_KEY }}
-        shell: bash
+      - name: Prepare comment
         run: |
-          ENDPOINT="https://models.inference.ai.azure.com/chat/completions"
-          MODEL="o3-mini"  # stronger reasoning for review; switch to gpt-4o-mini if you prefer speed
+          echo "Preparing PR comment..."
+          {
+            echo "## 🤖 AI PR Summary & Review"
+            echo
+            cat ai_output.txt
+            echo
+            echo "---"
+            echo "_Generated by GitHub Models (gpt-4o-mini)._"
+          } > comment.md
 
-          python - << 'PY' > payload_review.json
-import json
-payload = {
-  "model": "o3-mini",
-  "temperature": 0.2,
-  "max_tokens": 2000,
-  "messages": [
-    {"role":"system","content": open('system_review.txt').read()},
-    {"role":"user","content": open('prompt_review.txt').read()}
-  ]
-}
-print(json.dumps(payload))
-PY
-
-          curl -sS "$ENDPOINT" \
-            -H "Content-Type: application/json" \
-            -H "api-key: $GH_MODELS_API_KEY" \
-            -d @payload_review.json > gh_review.json
-
-          python - << 'PY'
-import json
-data=json.load(open('gh_review.json'))
-msg=data.get("choices",[{}])[0].get("message",{}).get("content","(No review generated)")
-open('review.txt','w').write(msg)
-PY
-
-      # OPTIONAL: Second opinion via OpenAI
-      - name: Call OpenAI GPT for Review (optional)
-        id: openai_review
-        if: ${{ secrets.OPENAI_API_KEY != '' }}
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-        shell: bash
-        run: |
-          OPENAI_ENDPOINT="https://api.openai.com/v1/chat/completions"
-
-          python - << 'PY' > payload_openai_review.json
-import json
-payload = {
-  "model": "gpt-4o",
-  "temperature": 0.2,
-  "max_tokens": 1500,
-  "messages": [
-    {"role":"system","content": open('system_review.txt').read()},
-    {"role":"user","content": open('prompt_review.txt').read()}
-  ]
-}
-print(json.dumps(payload))
-PY
-
-          curl -sS "$OPENAI_ENDPOINT" \
-            -H "Content-Type: application/json" \
-            -H "Authorization: Bearer $OPENAI_API_KEY" \
-            -d @payload_openai_review.json > openai_review.json
-
-          python - << 'PY'
-import json
-data=json.load(open('openai_review.json'))
-msg=data.get("choices",[{}])[0].get("message",{}).get("content","")
-open('openai_review.txt','w').write(msg)
-PY
-
-      - name: Derive risk level from review (simple heuristic)
-        id: risk
-        shell: bash
-        run: |
-          # Naive heuristic: mark high risk if certain keywords present
-          CONTENT="$(cat review.txt)"
-          if echo "$CONTENT" | grep -Ei '(security|sql injection|race condition|data loss|privilege|secrets|credentials|vulnerability|unsafe)'; then
-            echo "level=high" >> $GITHUB_OUTPUT
-          elif echo "$CONTENT" | grep -Ei '(bug|error|failure|perf|performance|memory|leak|deadlock|timeout)'; then
-            echo "level=medium" >> $GITHUB_OUTPUT
-          else
-            echo "level=low" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Compose final comment
-        id: compose
-        shell: bash
-        run: |
-          echo "## 📝 PR Summary" > comment.md
-          echo "" >> comment.md
-          sed -e 's/\r//g' summary.txt >> comment.md
-          echo "" >> comment.md
-
-          echo "---" >> comment.md
-          echo "## 🔍 AI Review" >> comment.md
-          echo "" >> comment.md
-          sed -e 's/\r//g' review.txt >> comment.md
-          echo "" >> comment.md
-
-          if [ -s openai_review.txt ]; then
-            echo "---" >> comment.md
-            echo "### 🧠 Second Opinion (OpenAI)" >> comment.md
-            echo "" >> comment.md
-            sed -e 's/\r//g' openai_review.txt >> comment.md
-            echo "" >> comment.md
-          fi
-
-          echo "---" >> comment.md
-          echo "_Risk level detected: **${{ steps.risk.outputs.level }}**._" >> comment.md
-          echo "_Auto-generated by PR Summary & Review workflow._" >> comment.md
-
-      - name: Post comment to PR
+      - name: Find existing AI comment
+        id: find_comment
         uses: actions/github-script@v7
         with:
           script: |
-            const fs = require('fs');
-            const body = fs.readFileSync('comment.md','utf8');
-            await github.rest.issues.createComment({
+            const marker = "## 🤖 AI PR Summary & Review";
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
